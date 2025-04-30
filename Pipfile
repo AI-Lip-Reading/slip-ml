@@ -4,6 +4,20 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
+yt-dlp = "*"
+moviepy = "*"
+torch = "*"
+transformers = "*"
+boto3 = "*"
+jupyter = "*"
+ipykernel = "*"
+numpy = "*"
+beautifulsoup4 = "*"
+google-api-python-client = "*"
+python-dotenv = "*"
+opencv-python = "*"
+wandb = "*"
+sagemaker = "*"
 
 [dev-packages]
 

@@ -1,3 +1,5 @@
 .DS_Store
 input_data/
 preprocessed_data/
+.env
+wandb/
