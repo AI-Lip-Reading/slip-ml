@@ -18,6 +18,7 @@ python-dotenv = "*"
 opencv-python = "*"
 wandb = "*"
 sagemaker = "*"
+jiwer = "*"
 
 [dev-packages]
 

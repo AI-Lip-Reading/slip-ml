@@ -1,6 +1,0 @@
-torch
-cv2
-numpy 
-boto3
-shutil
-wandb
