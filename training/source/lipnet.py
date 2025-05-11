@@ -32,7 +32,7 @@ s3_client = boto3.client("s3")
 
 # Based on https://github.com/pytorch/examples/blob/master/mnist/main.py
 class LipNet(nn.Module):
-    def __init__(self, img_c, img_w, img_h, frames_n, output_size=31):
+    def __init__(self, img_c, img_w, img_h, frames_n, output_size=32):
         super(LipNet, self).__init__()
         self.img_c = img_c
         self.img_w = img_w
