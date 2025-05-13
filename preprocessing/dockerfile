@@ -1,9 +1,15 @@
 FROM python:3.11-slim-buster
 
 COPY requirements.txt .
+COPY gather-data.py .
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    libgl1 \
+    libglib2.0-0 \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+
 RUN pip install --no-cache-dir -r requirements.txt
-
-COPY the_script.py .
-
-ENTRYPOINT ["python", "the_script.py"]
-
+RUN pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
