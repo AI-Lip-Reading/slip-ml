@@ -1,0 +1,7 @@
+transformers
+peft
+bitsandbytes
+datasets
+jiwer
+wandb
+numpy
