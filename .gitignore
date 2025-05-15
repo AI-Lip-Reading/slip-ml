@@ -3,3 +3,4 @@ input_data/
 preprocessed_data/
 .env
 wandb/
+inference/testing_vid.mp4
