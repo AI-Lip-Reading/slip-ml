@@ -4,3 +4,5 @@ preprocessed_data/
 .env
 wandb/
 inference/testing_vid.mp4
+inference/vallr_models/
+.gitignore
