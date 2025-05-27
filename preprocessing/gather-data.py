@@ -295,7 +295,6 @@ def split_audio_video(video_file, both=True):
             # Write video to file
             video_only = video_chunk.without_audio()
             video_only.write_videofile(video_path, codec="libx264", audio_codec="aac")
-            #upload_to_s3(video_path, "data/video")
             video_only.close()
 
         # Close the video clip
@@ -476,8 +475,9 @@ def process_video_to_sentence_phonemes(video_file):
                 
             print(f"Saved sentence {i+1}/{len(all_sentences)} to {json_filename}")
             
+            train_test_split = weighted_train_test_split()
             # Upload to S3
-            upload_to_s3(json_filename, "data/transcriptions")
+            upload_to_s3(json_filename, f"data/transcriptions/{train_test_split}")
             json_files.append(json_filename)
             
             # Clean up JSON file after upload
