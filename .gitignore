@@ -6,3 +6,6 @@ wandb/
 inference/testing_vid.mp4
 inference/vallr_models/
 .gitignore
+*.mp4
+*.mp3
+*.json
