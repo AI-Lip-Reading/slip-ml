@@ -483,8 +483,6 @@ def process_video_to_sentence_phonemes(video_file):
             # Clean up JSON file after upload
             os.remove(json_filename)
             
-        # Clean up audio file
-        os.remove(video_file)
         
         return json_files
         
