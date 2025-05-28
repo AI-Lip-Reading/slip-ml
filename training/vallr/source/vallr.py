@@ -16,6 +16,7 @@ import numpy as np
 from jiwer import wer, cer
 import wandb
 import boto3
+import math
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -29,90 +30,172 @@ def get_video_chunk_names(path):
     chunk_name = path.split('__')[2].split('.')[0]
     return video_id, chunk_name
 
-class VALLRModel(nn.Module):
-    def __init__(self, num_classes=40, max_frames=75):
-        super(VALLRModel, self).__init__()
-        self.max_frames = max_frames
-        self.num_classes = num_classes
+# Positional embedding helpers
+def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):
+    """
+    grid_size: int of the grid height and width
+    return:
+    pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
+    """
+    grid_h = grid_size
+    grid_w = grid_size
+    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, np.arange(grid_h), np.arange(grid_w))
+    if cls_token:
+        pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)
+    return pos_embed
 
-        # Visual Feature Extractor: ViT
+def get_2d_sincos_pos_embed_from_grid(embed_dim, grid_h, grid_w):
+    assert embed_dim % 2 == 0
+    
+    # use half of dimensions to encode grid_h
+    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid_h)  # (H, D/2)
+    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid_w)  # (W, D/2)
+    
+    # Create position embeddings for each spatial position
+    emb_h_expanded = np.repeat(emb_h, len(grid_w), axis=0)  # (H*W, D/2)
+    emb_w_expanded = np.tile(emb_w, (len(grid_h), 1))  # (H*W, D/2)
+    
+    emb = np.concatenate([emb_h_expanded, emb_w_expanded], axis=1)  # (H*W, D)
+    return emb
+
+def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
+    """
+    embed_dim: output dimension for each position
+    pos: a list of positions to be encoded: size (M,)
+    out: (M, D)
+    """
+    assert embed_dim % 2 == 0
+    omega = np.arange(embed_dim // 2, dtype=float)
+    omega /= embed_dim / 2.
+    omega = 1. / 10000**omega  # (D/2,)
+
+    pos = pos.reshape(-1)  # (M,)
+    out = np.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
+
+    emb_sin = np.sin(out) # (M, D/2)
+    emb_cos = np.cos(out) # (M, D/2)
+
+    emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
+    return emb
+
+class SpatioTemporalEmbeddingModule(nn.Module):
+    def __init__(self, in_channels=3, out_channels=64, kernel_size=(3, 5, 5), stride=(1, 1, 1), vit_hidden_size=768, patch_size=16, image_size=224, output_frames=4):
+        super().__init__()
+        self.conv3d = nn.Conv3d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=(1, 2, 2)  # Maintain spatial size, pad temporal
+        )
+        self.bn3d = nn.BatchNorm3d(out_channels)
+        self.prelu = nn.PReLU(out_channels)
+        self.temporal_pool = nn.AdaptiveAvgPool3d((output_frames, image_size, image_size))  # Reduce to 4 frames
+        self.patch_size = patch_size
+        self.num_patches_per_frame = (image_size // patch_size) ** 2  # 196 patches
+        self.num_patches = self.num_patches_per_frame * output_frames  # 784 patches
+        self.projection = nn.Linear(out_channels * patch_size * patch_size, vit_hidden_size)  # Project to 768
+        self.dropout = nn.Dropout(0.1)  # Regularization
+
+    def forward(self, x):
+        # Input: (B, T, C, H, W), e.g., (B, 25, 3, 224, 224)
+        # Permute to (B, C, T, H, W) format for 3D Conv
+        x = x.permute(0, 2, 1, 3, 4)  # [B, C, T, H, W]
+        x = self.conv3d(x)  # (B, C', T', H', W')
+        x = self.bn3d(x)
+        x = self.prelu(x)
+        x = self.temporal_pool(x)  # (B, C', 4, H, W)
+        
+        # Reshape into patches
+        B, C, T, H, W = x.shape
+        x = x.view(B, C, T * H, W).unfold(2, self.patch_size, self.patch_size).unfold(3, self.patch_size, self.patch_size)
+        x = x.permute(0, 2, 3, 1, 4, 5).contiguous()  # (B, T*H//P, W//P, C, P, P)
+        x = x.view(B, self.num_patches, -1)  # (B, 784, C*P*P)
+        x = self.projection(x)  # (B, 784, 768)
+        x = self.dropout(x)
+        return x
+
+class VALLRModel(nn.Module):
+    def __init__(self, num_classes=40, num_frames=25, output_frames=4):
+        super(VALLRModel, self).__init__()
+        self.num_frames = num_frames
+        self.output_frames = output_frames
+        self.num_classes = num_classes
+        
+        # Add these two lines to define the variables
+        self.image_size = 224
+        self.patch_size = 16
+        
+        # 3D Spatio-Temporal Embedding Module
+        self.st_module = SpatioTemporalEmbeddingModule(output_frames=output_frames)
+        
+        # ViT
         self.vit = ViTModel.from_pretrained("google/vit-base-patch16-224")
         self.vit_config = ViTConfig.from_pretrained("google/vit-base-patch16-224")
         hidden_size = self.vit_config.hidden_size  # 768
-
-        # Adapter Network (Table 1 in paper)
-        self.adapter = nn.Sequential(
-            nn.Conv1d(hidden_size, 384, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool1d(kernel_size=2),  # (B, 384, T/2)
-            nn.Conv1d(384, 192, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool1d(kernel_size=2),  # (B, 192, T/4)
-            nn.Conv1d(192, 48, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool1d(9),  # Ensure T=9
-            nn.Conv1d(48, 16, kernel_size=3, padding=1),
-            nn.ReLU(),
-            #nn.MaxPool1d(kernel_size=3),  # (B, 48, T/12)
-            #nn.Conv1d(48, 16, kernel_size=3, padding=1),
-            #nn.ReLU(),
-            #nn.MaxPool1d(kernel_size=2),  # (B, 16, T/24)
-        )
-        self.adapter_norm = nn.LayerNorm(16)
-        self.adapter_dropout = nn.Dropout(0.1)
-
+        self.vit_encoder = self.vit.encoder
+    
+        # CLS token and positional embeddings
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        
+        # Calculate num_patches using self variables
+        self.num_patches_per_frame = (self.image_size // self.patch_size) ** 2  # 196 patches for 224/16
+        self.num_patches = self.num_patches_per_frame * output_frames  # 784 patches
+        self.pos_embed = nn.Parameter(torch.zeros(1, 1 + self.num_patches, hidden_size))
+        
         # CTC Head
-        self.fc = nn.Linear(16, num_classes)
+        self.ctc_head = nn.Linear(hidden_size, num_classes)
+        self.dropout = nn.Dropout(0.1)
+    
+        # Initialize with sinusoidal positional embeddings
+        self._init_pos_embed()
 
-    def forward(self, x, frame_lengths):
-        # x: [batch_size, max_frames, channels=3, height=224, width=224]
-        batch_size, max_frames, channels, height, width = x.size()
-        #logger.debug(f"Input shape to forward: {x.shape}")
+    def _init_pos_embed(self):
+        # For a structure with 14×14 patches per frame and 4 frames
+        # We create a grid of size (14×4)×14 = 56×14
+        h_grid_size = int(math.sqrt(self.num_patches_per_frame)) * self.output_frames  # 14×4=56
+        w_grid_size = int(math.sqrt(self.num_patches_per_frame))  # 14
+        
+        # Create a non-square positional embedding grid
+        pos_embed = get_2d_sincos_pos_embed_from_grid(
+            self.pos_embed.shape[-1],
+            np.arange(h_grid_size),
+            np.arange(w_grid_size)
+        )
+        
+        # Add CLS token embedding
+        pos_embed = np.concatenate([np.zeros([1, self.pos_embed.shape[-1]]), pos_embed], axis=0)
+        
+        # Ensure the correct number of positions
+        assert pos_embed.shape[0] == 1 + self.num_patches, f"Position embedding size mismatch: got {pos_embed.shape[0]}, expected {1 + self.num_patches}"
+        
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
-        # Reshape for ViT
-        x = x.view(batch_size * max_frames, channels, height, width)  # [batch_size * max_frames, 3, 224, 224]
-        #logger.debug(f"After reshape for ViT: {x.shape}")
-
-        # ViT forward pass
-        vit_outputs = self.vit(pixel_values=x).last_hidden_state  # [batch_size * max_frames, 197, 768]
-        vit_features = vit_outputs[:, 0, :]  # CLS token: [batch_size * max_frames, 768]
-        vit_features = vit_features.view(batch_size, max_frames, -1)  # [batch_size, max_frames, 768]
-
-        # Mask padded frames
-        mask = torch.arange(max_frames, device=x.device)[None, :] < frame_lengths[:, None]  # [batch_size, max_frames]
-        vit_features = vit_features * mask.unsqueeze(-1).float()
-
-        vit_features = vit_features.permute(0, 2, 1)  # [batch_size, 768, max_frames]
-        #logger.debug(f"ViT features shape: {vit_features.shape}")
-
-        # Adapter network with channel validation
-        x = vit_features
-        expected_channels = [768, 384, 384, 384, 192, 192, 192, 48, 48, 48, 16, 16]
-        for i, layer in enumerate(self.adapter):
-            if isinstance(layer, nn.Conv1d):
-                actual_channels = x.size(1)
-                expected = expected_channels[i]
-                if actual_channels != expected:
-                    logger.error(f"Channel mismatch at layer {i} (Conv1d): expected {expected}, got {actual_channels}")
-                    raise RuntimeError(f"Channel mismatch in Conv1d at layer {i}")
-            x = layer(x)
-            #logger.debug(f"Adapter layer {i} ({layer.__class__.__name__}) output shape: {x.shape}")
-            if (isinstance(layer, nn.MaxPool1d) or isinstance(layer, nn.AdaptiveAvgPool1d)) and x.size(2) == 0:
-                logger.error(f"Zero output size after layer {i}, input shape: {vit_features.shape}, frame_lengths: {frame_lengths}")
-                raise RuntimeError(f"Zero output size in MaxPool1d at layer {i}")
-
-        # Adapter network
-        adapter_out = x  # [batch_size, 16, reduced_frames]
-        adapter_out = self.adapter_norm(adapter_out.permute(0, 2, 1)).permute(0, 2, 1)
-        adapter_out = self.adapter_dropout(adapter_out)
-
-        # CTC head
-        logits = self.fc(adapter_out.permute(0, 2, 1))  # [batch_size, reduced_frames, num_classes]
+    def forward(self, x):
+        # Input: (B, T, C, H, W), e.g., (B, 25, 3, 224, 224)
+        B = x.shape[0]
+        x = self.st_module(x)  # (B, 784, 768)
+        
+        # Add [CLS] token
+        cls_tokens = self.cls_token.expand(B, -1, -1)  # (B, 1, 768)
+        x = torch.cat((cls_tokens, x), dim=1)  # (B, 785, 768)
+        
+        # Add positional embeddings
+        x = x + self.pos_embed  # (B, 785, 768)
+        
+        # Important: Apply layer norm before feeding to transformer
+        # This mimics what happens in the ViT embeddings layer
+        x = nn.LayerNorm(x.shape[-1], eps=1e-12).to(x.device)(x)
+        
+        # Pass through encoder directly - encoder expects sequence already embedded
+        hidden_states = self.vit_encoder(x)[0]  # Extract last_hidden_state
+            
+        # CTC head: Use per-frame embeddings (skip [CLS])
+        frame_embeddings = hidden_states[:, 1:, :]  # (B, 784, 768)
+        frame_embeddings = frame_embeddings.view(B, self.output_frames, 196, 768)  # (B, 4, 196, 768)
+        frame_embeddings = frame_embeddings.mean(dim=2)  # (B, 4, 768), average per frame
+        logits = self.ctc_head(self.dropout(frame_embeddings))  # (B, 4, 40)
         logits = F.log_softmax(logits, dim=-1)
-
-        #logger.debug(f"Adapter output shape: {adapter_out.shape}")
-        #logger.debug(f"Logits shape: {logits.shape}")
-
         return logits
 
 class VALLRDataset(Dataset):
@@ -150,62 +233,57 @@ class VALLRDataset(Dataset):
             frames = data['frames']  # [T, H=224, W=224, C=3]
         frame_count = frames.shape[0]
         frames = torch.tensor(frames, dtype=torch.float32).permute(0, 3, 1, 2)  # [T, C=3, H=224, W=224]
-        #logger.debug(f"Video {video_file}: frames shape {frames.shape}, frame_count {frame_count}")
 
-        min_frames = 16
-        if frame_count < min_frames:
-            logger.warning(f"Low frame count {frame_count} in {video_file}, padding to {min_frames}")
-            padding = torch.zeros(min_frames - frame_count, frames.size(1), frames.size(2), frames.size(3))
-            frames = torch.cat([frames, padding], dim=0)
-            frame_count = min_frames
-
-
-        # Pad to max_frames (75)
-        max_frames = 75
-        if frame_count < max_frames:
-            padding = torch.zeros(max_frames - frame_count, frames.size(1), frames.size(2), frames.size(3))
-            frames = torch.cat([frames, padding], dim=0)
-        elif frame_count > max_frames:
-            frames = frames[:max_frames]
-            frame_count = max_frames
+        # Ensure exactly 25 frames
+        target_frames = 25
+        if frame_count < 25:
+            # Repeat last frame to pad
+            while frame_count < target_frames:
+                # Pad with last frame
+                padding = frames[-1:].repeat(1, 1, 1, 1)
+                frames = torch.cat([frames, padding], dim=0)
+                frame_count += 1
+            frame_count = 25
+        elif frame_count > 25:
+            # Uniform sampling
+            indices = torch.linspace(0, frame_count-1, target_frames).long()
+            frames = frames[indices]
+            frame_count = 25
+        elif frame_count != 25:
+            logger.error(f"Unexpected frame count {frame_count} in {video_file}")
+            raise ValueError(f"Expected 24, 25, or 30 frames, got {frame_count}")
 
         # Normalize frames
         transform = transforms.Compose([
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
-        frames = transform(frames)  # [max_frames, 3, 224, 224]
+        frames = transform(frames)  # [25, 3, 224, 224]
 
         # Load labels
         with open(label_path, "r") as f:
             label_data = json.load(f)
-        labels = torch.tensor(label_data["phoneme_indices"], dtype=torch.long)
         phoneme_indices = label_data["phoneme_indices"]
         if not all(0 <= idx < len(self.phoneme_vocab) for idx in phoneme_indices):
             logger.error(f"Invalid phoneme indices in {label_file}: {phoneme_indices}")
             raise ValueError(f"Phoneme indices must be in range [0, {len(self.phoneme_vocab)-1}]")
+        labels = torch.tensor(phoneme_indices, dtype=torch.long)
 
-        # Estimate input_length after adapter (approximate reduction per Table 1)
-        input_length = max(1, min(9, frame_count // 4)) #input_length = max(1, frame_count // 24) #max(1, min(3, frame_count // 24))
+        # Input length for CTC (4 output frames from 3D module)
+        input_length = 4  # Fixed due to temporal pooling to 4 frames
         target_length = len(labels)
 
-        #logger.debug(f"Input length: {input_length}, Target length: {target_length}, Frame count: {frame_count}")
-
-        return frames, labels, input_length, target_length, frame_count
-
+        return frames, labels, input_length, target_length
 
 def collate_fn(batch):
-    frames, phonemes, input_lengths, target_lengths, frame_counts = zip(*batch)
-    max_frames = max(frame_counts)
-    frames = torch.stack([f[:max_frames] for f in frames])  # [batch_size, max_frames, 3, 224, 224]
+    frames, phonemes, input_lengths, target_lengths = zip(*batch)
+    frames = torch.stack(frames)  # [batch_size, 25, 3, 224, 224]
     max_phoneme_len = max(len(p) for p in phonemes)
     phonemes_padded = torch.zeros(len(phonemes), max_phoneme_len, dtype=torch.long)
     for i, p in enumerate(phonemes):
         phonemes_padded[i, :len(p)] = p
     input_lengths = torch.tensor(input_lengths, dtype=torch.long)
     target_lengths = torch.tensor(target_lengths, dtype=torch.long)
-    frame_lengths = torch.tensor(frame_counts, dtype=torch.long)
-    #logger.debug(f"Collate output: frames shape {frames.shape}, phonemes shape {phonemes_padded.shape}")
-    return frames, phonemes_padded, input_lengths, target_lengths, frame_lengths
+    return frames, phonemes_padded, input_lengths, target_lengths
 
 def setup_wandb(args):
     logger.info("Logging in to W&B")
@@ -311,14 +389,13 @@ def validate_test(model, device, data_loader, ctc_loss, idx_to_phoneme):
     correct = 0
     total = 0
     with torch.no_grad():
-        for frames, phonemes, input_lengths, target_lengths, frame_lengths in data_loader:
-            frames, phonemes, input_lengths, target_lengths, frame_lengths = (
+        for frames, phonemes, input_lengths, target_lengths in data_loader:
+            frames, phonemes, input_lengths, target_lengths = (
                 frames.to(device), phonemes.to(device), 
-                input_lengths.to(device), target_lengths.to(device), frame_lengths.to(device)
+                input_lengths.to(device), target_lengths.to(device)
             )
             try:
-                outputs = model(frames, frame_lengths).permute(1, 0, 2)
-                logger.debug(f"CTC inputs: outputs shape {outputs.shape}, input_lengths {input_lengths}")
+                outputs = model(frames).permute(1, 0, 2)  # (T=4, B, 40)
                 loss = ctc_loss(outputs, phonemes, input_lengths, target_lengths)
                 all_loss += loss.item()
             except Exception as e:
@@ -327,8 +404,7 @@ def validate_test(model, device, data_loader, ctc_loss, idx_to_phoneme):
 
             _, preds = outputs.max(2)
             preds = preds.transpose(1, 0).cpu().numpy()
-            phonemes_cpu = phonemes.cpu().numpy()  # Move phonemes to CPU for decoding
-            #logger.debug(f"Phonemes device: {phonemes.device}, Phonemes CPU shape: {phonemes_cpu.shape}")
+            phonemes_cpu = phonemes.cpu().numpy()
             for i in range(frames.size(0)):
                 pred_seq = decode_ctc(preds[i][:input_lengths[i]], idx_to_phoneme)
                 true_seq = ' '.join(idx_to_phoneme[idx] for idx in phonemes_cpu[i, :target_lengths[i].item()])
@@ -369,24 +445,33 @@ def train(args, device):
                      'Y', 'Z', 'ZH']
     idx_to_phoneme = {i: p for i, p in enumerate(phoneme_vocab)}
 
-    model = VALLRModel(num_classes=40, max_frames=75).to(device)
+    model = VALLRModel(num_classes=40, num_frames=25, output_frames=4).to(device)
     if is_distributed and use_cuda:
         model = torch.nn.parallel.DistributedDataParallel(model)
     else:
         model = torch.nn.DataParallel(model)
 
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=2, threshold=0.01, verbose=True
+    # Sequential Training: Phase 1 - Train 3D module and CTC head
+    logger.info("Starting Phase 1: Training 3D Spatio-Temporal Module and CTC Head")
+    for param in model.module.vit.parameters():
+        param.requires_grad = False  # Freeze ViT
+    optimizer_phase1 = optim.Adam([
+        {'params': model.module.st_module.parameters(), 'lr': args.lr},
+        {'params': model.module.ctc_head.parameters(), 'lr': args.lr},
+        {'params': model.module.cls_token, 'lr': args.lr},
+        {'params': model.module.pos_embed, 'lr': args.lr}
+    ], weight_decay=0.1)
+    scheduler_phase1 = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer_phase1, mode='min', factor=0.5, patience=2, threshold=0.01, verbose=True
     )
     ctc_loss = CTCLoss(blank=0, zero_infinity=True)
 
-    for epoch in range(args.epochs):
+    phase1_epochs = args.epochs // 2  # Half epochs for Phase 1
+    for epoch in range(phase1_epochs):
         model.train()
         train_loss = 0.0
         valid_batches = 0
-        for frames, phonemes, input_lengths, target_lengths, frame_lengths in train_loader:
-            #logger.info(f"Frames shape: {frames.shape}, Phonemes shape: {phonemes.shape}")
+        for frames, phonemes, input_lengths, target_lengths in train_loader:
             if (target_lengths == 0).any():
                 logger.error(f"Zero target length detected, skipping")
                 continue
@@ -394,12 +479,12 @@ def train(args, device):
                 logger.error(f"Invalid frames, skipping")
                 continue
 
-            frames, phonemes, input_lengths, target_lengths, frame_lengths = (
+            frames, phonemes, input_lengths, target_lengths = (
                 frames.to(device), phonemes.to(device), 
-                input_lengths.to(device), target_lengths.to(device), frame_lengths.to(device)
+                input_lengths.to(device), target_lengths.to(device)
             )
-            optimizer.zero_grad()
-            outputs = model(frames, frame_lengths).permute(1, 0, 2)  # [T, batch_size, num_classes]
+            optimizer_phase1.zero_grad()
+            outputs = model(frames).permute(1, 0, 2)  # (T=4, B, 40)
             if torch.isnan(outputs).any() or torch.isinf(outputs).any():
                 logger.error(f"Invalid outputs, skipping")
                 continue
@@ -414,22 +499,23 @@ def train(args, device):
             for name, param in model.named_parameters():
                 if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
                     logger.error(f"Invalid gradient in {name}, skipping")
-                    optimizer.zero_grad()
+                    optimizer_phase1.zero_grad()
                     break
             else:
-                optimizer.step()
+                optimizer_phase1.step()
                 train_loss += loss.item()
                 valid_batches += 1
 
         if valid_batches > 0:
-            logger.info(f"Epoch [{epoch + 1}/{args.epochs}], Train Loss: {train_loss / valid_batches:.4f}")
+            logger.info(f"Phase 1 Epoch [{epoch + 1}/{phase1_epochs}], Train Loss: {train_loss / valid_batches:.4f}")
 
         val_loss, val_cer, val_wer, val_accuracy = validate_test(model, device, val_loader, ctc_loss, idx_to_phoneme)
-        scheduler.step(val_loss)
-        current_lr = optimizer.param_groups[0]['lr']
+        scheduler_phase1.step(val_loss)
+        current_lr = optimizer_phase1.param_groups[0]['lr']
 
         wandb.log({
             "epoch": epoch + 1,
+            "phase": 1,
             "train_loss": train_loss / valid_batches if valid_batches > 0 else 0.0,
             "val_loss": val_loss,
             "val_accuracy": val_accuracy,
@@ -438,7 +524,86 @@ def train(args, device):
             "learning_rate": current_lr
         })
 
-        logger.info(f"Epoch [{epoch + 1}/{args.epochs}], "
+        logger.info(f"Phase 1 Epoch [{epoch + 1}/{phase1_epochs}], "
+                    f"Train Loss: {train_loss / valid_batches:.4f}, "
+                    f"Val Loss: {val_loss:.4f}, "
+                    f"Val CER: {val_cer:.4f}, Val WER: {val_wer:.4f}, "
+                    f"Val Accuracy: {val_accuracy:.2f}%")
+
+    # Sequential Training: Phase 2 - Fine-tune entire model
+    logger.info("Starting Phase 2: Fine-tuning entire model")
+    for param in model.module.vit.parameters():
+        param.requires_grad = True  # Unfreeze ViT
+    optimizer_phase2 = optim.Adam([
+        {'params': model.module.st_module.parameters(), 'lr': args.lr},
+        {'params': model.module.vit.parameters(), 'lr': args.lr * 0.1},  # Smaller LR for ViT
+        {'params': model.module.ctc_head.parameters(), 'lr': args.lr},
+        {'params': model.module.cls_token, 'lr': args.lr},
+        {'params': model.module.pos_embed, 'lr': args.lr}
+    ], weight_decay=0.1)
+    scheduler_phase2 = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer_phase2, mode='min', factor=0.5, patience=2, threshold=0.01, verbose=True
+    )
+
+    phase2_epochs = args.epochs - phase1_epochs
+    for epoch in range(phase2_epochs):
+        model.train()
+        train_loss = 0.0
+        valid_batches = 0
+        for frames, phonemes, input_lengths, target_lengths in train_loader:
+            if (target_lengths == 0).any():
+                logger.error(f"Zero target length detected, skipping")
+                continue
+            if frames.isnan().any() or frames.isinf().any():
+                logger.error(f"Invalid frames, skipping")
+                continue
+
+            frames, phonemes, input_lengths, target_lengths = (
+                frames.to(device), phonemes.to(device), 
+                input_lengths.to(device), target_lengths.to(device)
+            )
+            optimizer_phase2.zero_grad()
+            outputs = model(frames).permute(1, 0, 2)  # (T=4, B, 40)
+            if torch.isnan(outputs).any() or torch.isinf(outputs).any():
+                logger.error(f"Invalid outputs, skipping")
+                continue
+
+            loss = ctc_loss(outputs, phonemes, input_lengths, target_lengths)
+            if torch.isnan(loss) or torch.isinf(loss):
+                logger.error(f"Invalid loss: {loss.item()}, skipping")
+                continue
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            for name, param in model.named_parameters():
+                if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                    logger.error(f"Invalid gradient in {name}, skipping")
+                    optimizer_phase2.zero_grad()
+                    break
+            else:
+                optimizer_phase2.step()
+                train_loss += loss.item()
+                valid_batches += 1
+
+        if valid_batches > 0:
+            logger.info(f"Phase 2 Epoch [{epoch + 1}/{phase2_epochs}], Train Loss: {train_loss / valid_batches:.4f}")
+
+        val_loss, val_cer, val_wer, val_accuracy = validate_test(model, device, val_loader, ctc_loss, idx_to_phoneme)
+        scheduler_phase2.step(val_loss)
+        current_lr = optimizer_phase2.param_groups[0]['lr']
+
+        wandb.log({
+            "epoch": epoch + 1 + phase1_epochs,
+            "phase": 2,
+            "train_loss": train_loss / valid_batches if valid_batches > 0 else 0.0,
+            "val_loss": val_loss,
+            "val_accuracy": val_accuracy,
+            "val_cer": val_cer,
+            "val_wer": val_wer,
+            "learning_rate": current_lr
+        })
+
+        logger.info(f"Phase 2 Epoch [{epoch + 1}/{phase2_epochs}], "
                     f"Train Loss: {train_loss / valid_batches:.4f}, "
                     f"Val Loss: {val_loss:.4f}, "
                     f"Val CER: {val_cer:.4f}, Val WER: {val_wer:.4f}, "
