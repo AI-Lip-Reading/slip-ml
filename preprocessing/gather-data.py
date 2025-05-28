@@ -499,7 +499,7 @@ def audio_to_text_phoneme(audio_file):
             f"{os.getcwd()}/{audio_file}",
             generate_kwargs={"language": "en", "task": "transcribe"}
         )
-        text = result["text"].strip()
+        text = result["text"].strip().replace('.', '').replace('?', '').replace('!', '')
         video_id, chunk_name = get_video_chunk_names(audio_file)
         
         # Validate text
@@ -518,6 +518,11 @@ def audio_to_text_phoneme(audio_file):
 
         # Get phonemes and their indices
         phoneme_sequence, phoneme_indices = get_phonemes_from(text)
+        
+        if len(phoneme_sequence) == 0:
+            print(f"No phonemes found for transcription: '{text}'")
+            os.remove(audio_file)
+            return False, None
         
         data = {
             "video_id": video_id,
