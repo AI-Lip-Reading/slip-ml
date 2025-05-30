@@ -1,7 +1,10 @@
-transformers
-peft
-bitsandbytes
-datasets
-jiwer
-wandb
-numpy
+# Optimized for PyTorch 2.2.0 + Llama 3.2-1B-Instruct
+accelerate>=0.25.0
+transformers==4.44.2
+datasets>=2.21.0
+peft>=0.13.0
+bitsandbytes>=0.44.0
+jiwer==3.0.3
+wandb>=0.18.0
+triton>=2.3.0
+einops>=0.8.0
